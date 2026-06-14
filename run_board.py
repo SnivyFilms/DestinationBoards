@@ -1,4 +1,4 @@
-from StamfordDestinationBoard import main
+from destination_board import main
 
 
 if __name__ == "__main__":
