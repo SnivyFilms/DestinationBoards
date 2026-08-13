@@ -1,6 +1,6 @@
 # Destination Boards
 
-A Tkinter passenger information display that shows upcoming trains for Amtrak and MTA station codes.
+A passenger information display that shows upcoming trains for Amtrak and MTA station codes.
 
 ## Features
 - Pulls data from `https://backend-unified.mylirr.org/locations` (API version 3.0)
