@@ -1,0 +1,6 @@
+{
+  "station_code": "NHV",
+  "train_count": 15,
+  "refresh_seconds": 60,
+  "show_stopping_pattern": true
+}

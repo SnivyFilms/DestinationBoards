@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import time
+import zipfile
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, TYPE_CHECKING, cast
 
@@ -17,6 +19,7 @@ AMTRAK_RT_URL = "https://asm-backend.transitdocs.com/gtfs/amtrak"
 MNR_GTFS_URL = "https://rrgtfsfeeds.s3.amazonaws.com/gtfsmnr.zip"
 LIRR_GTFS_URL = "https://rrgtfsfeeds.s3.amazonaws.com/gtfslirr.zip"
 AMTRAK_GTFS_URL = "https://content.amtrak.com/content/gtfs/GTFS.zip"
+MTA_RADAR_STATUS_URL = "https://radar.mta.info/status"
 DEFAULT_MTA_GTFS_URLS = (MNR_GTFS_URL, LIRR_GTFS_URL)
 
 DEFAULT_STATION_CODE = "NYK"
@@ -24,14 +27,51 @@ DEFAULT_TRAIN_COUNT = 15
 DEFAULT_REFRESH_SECONDS = 60
 DEFAULT_SCROLL_MS = 180
 DEFAULT_TITLE_TEXT = "DESTINATION BOARD"
+DEFAULT_CONFIG_PATH = "destination-board.json"
 
-STATION_CODE_ALIASES = {
-    "2SM": ["STM"],
-    "NYK": ["NYP"],
-    "NYP": ["NYK"],
+_STATION_CODE_GROUPS = (
+    # Verified against Radar station data and the Amtrak GTFS stops feed.
+    ("NYK", "NYP"),
+    ("2BP", "BRP"),  # Bridgeport
+    ("0HM", "CRT"),  # Croton-Harmon
+    ("2NH", "NHV"),  # New Haven Union Station
+    ("2SS", "STS"),  # New Haven State Street
+    ("2NR", "NRO"),  # New Rochelle
+    ("0PO", "POU"),  # Poughkeepsie
+    ("2SM", "STM"),  # Stamford
+    ("0YK", "YNY"),  # Yonkers
+)
+
+STATION_DISPLAY_NAMES = {
+    "NYK": "New York Penn",
+    "NYP": "New York Penn",
 }
 
-HEADER_TEXT = "RAILROAD  INTENDED  PLATFORM  DESTINATION             EXPECTED   STATUS"
+_STATION_NAME_CANONICAL = {
+    "pennstation": "New York Penn",
+    "nymoynihantrainhallatpennstation": "New York Penn",
+    "moynihantrainhall": "New York Penn",
+    "southstation": "Boston South Station",
+    "bostonsouthstation": "Boston South Station",
+}
+
+
+def _build_station_aliases() -> Dict[str, List[str]]:
+    aliases: Dict[str, List[str]] = {}
+    for group in _STATION_CODE_GROUPS:
+        for code in group:
+            aliases[code] = [other for other in group if other != code]
+    return aliases
+
+
+STATION_CODE_ALIASES = _build_station_aliases()
+
+
+def _canonical_station_name(name: str) -> str:
+    normalized = _normalize_station_name(name)
+    return _STATION_NAME_CANONICAL.get(normalized, name)
+
+HEADER_TEXT = "RAILROAD  SERVICE TYPE              INTENDED  PLATFORM  DESTINATION             EXPECTED   STATUS"
 
 
 @dataclass
@@ -44,6 +84,7 @@ class DisplayTrain:
     status_text: str
     stops_text: str
     source: str
+    service_name: str = ""
 
 
 @dataclass
@@ -56,6 +97,7 @@ class StationNameResolver:
     _lirr_names: Dict[str, str] = field(default_factory=dict, init=False)
     _mta_names: Dict[str, str] = field(default_factory=dict, init=False)
     _amtrak_names: Dict[str, str] = field(default_factory=dict, init=False)
+    _amtrak_trip_services: Dict[str, str] = field(default_factory=dict, init=False)
     _last_loaded: float = field(default=0.0, init=False)
 
     def ensure_loaded(self) -> None:
@@ -66,11 +108,13 @@ class StationNameResolver:
         mnr_names = self._load_mta_names(self.mnr_gtfs_url)
         lirr_names = self._load_mta_names(self.lirr_gtfs_url)
         amtrak_names = self._load_amtrak_names()
+        amtrak_trip_services = _load_amtrak_trip_services(self.amtrak_gtfs_url)
 
         self._mnr_names = mnr_names
         self._lirr_names = lirr_names
         self._mta_names = {**mnr_names, **lirr_names}
         self._amtrak_names = amtrak_names
+        self._amtrak_trip_services = amtrak_trip_services
 
         if mnr_names or lirr_names or amtrak_names:
             self._last_loaded = now
@@ -79,13 +123,19 @@ class StationNameResolver:
         if not code:
             return ""
         code = code.upper()
-        return self._mta_names.get(code, code)
+        return _canonical_station_name(STATION_DISPLAY_NAMES.get(code, self._mta_names.get(code, code)))
 
     def resolve_amtrak(self, code: str) -> str:
         if not code:
             return ""
         code = code.upper()
-        return self._amtrak_names.get(code, code)
+        return _canonical_station_name(STATION_DISPLAY_NAMES.get(code, self._amtrak_names.get(code, code)))
+
+    def canonical_name(self, name: str) -> str:
+        return _canonical_station_name(name)
+
+    def resolve_amtrak_service(self, trip_id: str) -> str:
+        return self._amtrak_trip_services.get((trip_id or "").strip(), "")
 
     def related_station_codes(self, code: str) -> List[str]:
         code = (code or "").upper().strip()
@@ -267,6 +317,102 @@ def _parse_amtrak_train_number(trip_id: str) -> str:
     return trip_id
 
 
+AMTRAK_SERVICE_NAMES = {
+    "NER": "Northeast Regional",
+    "NEC": "Northeast Regional",
+    "MET": "Metropolitan",
+    "ACS": "Acela",
+    "ACE": "Acela",
+    "CRES": "Capitol Corridor",
+    "CAPI": "Capitol Corridor",
+    "CAL": "California Zephyr",
+    "CAR": "Carolinian",
+    "CRESCENT": "Crescent",
+    "EMPIRE": "Empire Service",
+    "ETH": "Ethan Allen Express",
+    "HIA": "Hiawatha",
+    "KEY": "Keystone Service",
+    "LAKE": "Lake Shore Limited",
+    "LSL": "Lake Shore Limited",
+    "MAP": "Maple Leaf",
+    "PAL": "Palmetto",
+    "PENN": "Pennsylvanian",
+    "SIL": "Silver Service",
+    "SILVER": "Silver Service",
+    "VERM": "Vermonter",
+}
+
+
+def _amtrak_service_name(trip: Any, resolver: Optional[StationNameResolver] = None) -> str:
+    route_id = str(getattr(trip, "route_id", "") or "").upper()
+    route_name = str(getattr(trip, "route_long_name", "") or "").strip()
+    short_name = str(getattr(trip, "route_short_name", "") or "").strip()
+    for candidate in (route_id, short_name.upper(), route_name.upper()):
+        if candidate in AMTRAK_SERVICE_NAMES:
+            return AMTRAK_SERVICE_NAMES[candidate]
+    if route_name:
+        return route_name
+    if short_name:
+        return short_name
+    trip_id = str(getattr(trip, "trip_id", "") or "").upper()
+    if resolver:
+        static_name = resolver.resolve_amtrak_service(str(getattr(trip, "trip_id", "") or ""))
+        if static_name:
+            return static_name
+    for code, name in AMTRAK_SERVICE_NAMES.items():
+        if code in trip_id:
+            return name
+    return "Amtrak"
+
+
+def _load_amtrak_trip_services(url: str) -> Dict[str, str]:
+    try:
+        response = requests.get(url, timeout=25)
+        response.raise_for_status()
+        import csv
+        import io
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            routes = {
+                row.get("route_id", ""): row.get("route_long_name", "")
+                for row in csv.DictReader(
+                    io.TextIOWrapper(archive.open("routes.txt"), encoding="utf-8")
+                )
+            }
+            services: Dict[str, str] = {}
+            for row in csv.DictReader(
+                io.TextIOWrapper(archive.open("trips.txt"), encoding="utf-8")
+            ):
+                trip_id = (row.get("trip_id") or "").strip()
+                service = (routes.get(row.get("route_id", "")) or "").strip()
+                if trip_id and service:
+                    services[trip_id] = service
+            return services
+    except (OSError, requests.RequestException, ValueError, KeyError, zipfile.BadZipFile):
+        return {}
+
+
+def _deduplicate_display_entries(entries: Iterable[DisplayTrain]) -> List[DisplayTrain]:
+    unique: List[DisplayTrain] = []
+    for entry in sorted(entries, key=lambda item: item.expected_ts or item.scheduled_ts or 0):
+        duplicate_index: Optional[int] = None
+        for index, existing in enumerate(unique):
+            if entry.source == existing.source or not entry.train_num or entry.train_num != existing.train_num:
+                continue
+            entry_time = entry.expected_ts or entry.scheduled_ts
+            existing_time = existing.expected_ts or existing.scheduled_ts
+            if entry_time is None or existing_time is None or abs(entry_time - existing_time) > 300:
+                continue
+            duplicate_index = index
+            break
+        if duplicate_index is None:
+            unique.append(entry)
+        elif entry.source == "MTA" and unique[duplicate_index].source != "MTA":
+            unique[duplicate_index] = entry
+    return unique
+
+
 def _load_gtfs_stop_names(url: str, code_field: str) -> Dict[str, str]:
     try:
         response = requests.get(url, timeout=25)
@@ -312,6 +458,7 @@ def _train_display_entries(
             continue
 
         destination = details.get("headsign") or details.get("summary") or train.get("train_num") or "Unknown"
+        destination = name_resolver.canonical_name(str(destination))
         scheduled_ts = stop_match.get("sched_time")
         status = train.get("status", {}) or {}
         expected_ts = _expected_timestamp(stop_match, status)
@@ -334,6 +481,7 @@ def _train_display_entries(
                 status_text=_compute_status(scheduled_ts, expected_ts),
                 stops_text=stops_text,
                 source=source_label,
+                service_name=str(details.get("branch") or source_label),
             )
         )
 
@@ -381,8 +529,10 @@ def _train_display_entries_amtrak(
         destination = "Unknown"
         if stop_ids:
             destination = name_resolver.resolve_amtrak(stop_ids[-1])
+        destination = name_resolver.canonical_name(destination)
 
         train_num = _parse_amtrak_train_number(trip_update.trip.trip_id)
+        service_name = _amtrak_service_name(trip_update.trip, name_resolver)
 
         if expected_ts and expected_ts < now_ts - 300:
             continue
@@ -397,6 +547,7 @@ def _train_display_entries_amtrak(
                 status_text=_compute_status(scheduled_ts, expected_ts or None),
                 stops_text=stops_text,
                 source="AMTRAK",
+                service_name=service_name,
             )
         )
 
@@ -513,7 +664,7 @@ class BoardApp:
         for _ in range(self.train_count):
             line_label = tk.Label(
                 self.rows_frame,
-                text="--      --:--   TBD      Loading...             --:--    SCHEDULED",
+                text="--      Loading...             --:--   TBD      Loading...             --:--    SCHEDULED",
                 font=self.font_main,
                 fg="#ffb000",
                 bg="black",
@@ -560,11 +711,12 @@ class BoardApp:
         width_px = max(self.root.winfo_width(), 800)
         char_px = max(self.font_main.measure("0"), 8)
         total_chars = max(60, int(width_px / char_px))
-        spacing = 2 * 5
-        fixed = 8 + 8 + 8 + 8 + 12
+        spacing = 2 * 6
+        fixed = 8 + 24 + 8 + 8 + 8 + 12
         remaining = max(10, total_chars - fixed - spacing)
         return {
             "railroad": 8,
+            "service": 24,
             "intended": 8,
             "platform": 8,
             "destination": remaining,
@@ -588,10 +740,31 @@ class BoardApp:
         self.font_clock.configure(size=int(self.base_fonts["clock"] * scale))
         self.font_status.configure(size=int(self.base_fonts["status"] * scale))
 
-    def _format_line(self, railroad: str, sched: str, platform: str, dest: str, expected: str, status: str) -> str:
+    def _format_line(
+        self,
+        railroad: str,
+        service: str,
+        sched: str,
+        platform: str,
+        dest: str,
+        expected: str,
+        status: str,
+    ) -> str:
         widths = self._compute_column_widths()
+        def fit(value: str, width: int) -> str:
+            value = str(value or "")
+            return value if len(value) <= width else value[: max(0, width - 3)] + "..."
+
+        railroad = fit(railroad, widths["railroad"])
+        service = fit(service, widths["service"])
+        sched = fit(sched, widths["intended"])
+        platform = fit(platform, widths["platform"])
+        dest = fit(dest, widths["destination"])
+        expected = fit(expected, widths["expected"])
+        status = fit(status, widths["status"])
         return (
             f"{railroad:<{widths['railroad']}}  "
+            f"{service:<{widths['service']}}  "
             f"{sched:>{widths['intended']}}  "
             f"{platform:^{widths['platform']}}  "
             f"{dest:<{widths['destination']}}  "
@@ -600,7 +773,10 @@ class BoardApp:
         )
 
     def _format_header(self) -> str:
-        return self._format_line("RAILROAD", "INTENDED", "PLATFORM", "DESTINATION", "EXPECTED", "STATUS")
+        return self._format_line(
+            "RAILROAD", "SERVICE TYPE", "INTENDED", "PLATFORM",
+            "DESTINATION", "EXPECTED", "STATUS",
+        )
 
     def _on_resize(self, *_: Any) -> None:
         self._update_fonts()
@@ -649,8 +825,7 @@ class BoardApp:
                 entries.extend(
                     _train_display_entries_amtrak(amtrak_feed, self.station_code, now_ts, self.name_resolver)
                 )
-            entries.sort(key=lambda item: item.expected_ts or item.scheduled_ts or 0)
-            self._render_entries(entries)
+            self._render_entries(_deduplicate_display_entries(entries))
             self.last_error = ""
             self.last_updated = now_ts
         except Exception as exc:  # noqa: BLE001
@@ -663,14 +838,19 @@ class BoardApp:
         for idx, label in enumerate(self.row_labels):
             if idx < len(entries):
                 entry = entries[idx]
-                sched = _format_time(entry.scheduled_ts)
+                intended_ts = entry.scheduled_ts or entry.expected_ts
+                sched = _format_time(intended_ts)
                 expected = _format_time(entry.expected_ts)
-                dest = (entry.destination or "").strip()
+                destination = (entry.destination or "").strip()
+                service = (entry.service_name or "").strip()
+                if entry.train_num:
+                    service = f"{service} ({entry.train_num})" if service else entry.train_num
                 line = self._format_line(
                     entry.source,
+                    service,
                     sched,
                     entry.platform,
-                    dest,
+                    destination,
                     expected,
                     entry.status_text,
                 )
@@ -678,7 +858,9 @@ class BoardApp:
                 self.stop_scrollers[idx].set_text(entry.stops_text)
             else:
                 label.config(
-                    text=self._format_line("--", "--:--", "TBD", "(no trains)", "--:--", "SCHEDULED")
+                    text=self._format_line(
+                        "--", "--", "--:--", "TBD", "(no trains)", "--:--", "SCHEDULED"
+                    )
                 )
                 self.stop_scrollers[idx].set_text("Stops: (none)")
 
@@ -722,6 +904,19 @@ def _prompt_train_count(default: int = DEFAULT_TRAIN_COUNT) -> int:  # type: ign
         return count
 
 
+def _load_board_config(path: str = DEFAULT_CONFIG_PATH) -> Dict[str, Any]:
+    try:
+        with open(path, encoding="utf-8") as config_file:
+            config = json.load(config_file)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to read {path}: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return config
+
+
 def _title_for_station(station_code: str, resolver: StationNameResolver) -> str:
     code = station_code.upper().strip()
     station_name = resolver.resolve_amtrak(code)
@@ -735,8 +930,14 @@ def _title_for_station(station_code: str, resolver: StationNameResolver) -> str:
 def main() -> None:
     import tkinter as tk
 
-    station_code = _prompt_station_code()
-    train_count = _prompt_train_count()
+    config = _load_board_config()
+    station_code = str(config.get("station_code") or _prompt_station_code()).strip().upper()
+    train_count = int(config.get("train_count") or _prompt_train_count())
+    refresh_seconds = int(config.get("refresh_seconds") or DEFAULT_REFRESH_SECONDS)
+    if not station_code:
+        raise ValueError("station_code cannot be empty")
+    if train_count < 1 or refresh_seconds < 5:
+        raise ValueError("train_count must be positive and refresh_seconds must be at least 5")
 
     resolver = StationNameResolver()
     resolver.ensure_loaded()
@@ -747,7 +948,7 @@ def main() -> None:
         root,
         station_code,
         train_count,
-        DEFAULT_REFRESH_SECONDS,
+        refresh_seconds,
         title_text=title_text,
         name_resolver=resolver,
     )
@@ -756,4 +957,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

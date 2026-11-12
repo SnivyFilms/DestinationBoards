@@ -1,0 +1,15 @@
+[Unit]
+Description=Destination Board LED panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/destination-board
+ExecStart=/usr/bin/python3 /opt/destination-board/pi_board.py --renderer matrix --config /boot/destination-board.json
+Restart=on-failure
+RestartSec=10
+User=pi
+
+[Install]
+WantedBy=multi-user.target

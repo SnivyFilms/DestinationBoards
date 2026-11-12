@@ -1,0 +1,28 @@
+{
+  "station_code": "NYK",
+  "train_count": 8,
+  "refresh_seconds": 60,
+  "show_stopping_pattern": true,
+  "matrix_width": 64,
+  "matrix_height": 32,
+  "brightness": 70,
+  "providers": [
+    "mta",
+    "amtrak",
+    "mbta"
+  ],
+  "colors": {
+    "background": "#000000",
+    "text": "#ffb000",
+    "on_time": "#00ff66",
+    "late": "#ff3333",
+    "early": "#33aaff",
+    "muted": "#777777"
+  },
+  "control_host": "0.0.0.0",
+  "control_port": 8080,
+  "control_token": "",
+  "mbta_api_base": "https://api-v3.mbta.com",
+  "vre_trip_updates_url": "",
+  "trirail_trip_updates_url": ""
+}
